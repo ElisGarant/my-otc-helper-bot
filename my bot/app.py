@@ -1,16 +1,19 @@
 import os
 import sqlite3
+import json
 import asyncio
 import logging
 import re
+import random
+import aiohttp
 from datetime import datetime, timedelta
 from flask import Flask
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ChatPermissions,
-    Message
+    CallbackQuery, ChatPermissions, ChatInviteLink,
+    Message, ChatMember
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -18,12 +21,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 
 # ===================== НАСТРОЙКИ =====================
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = "8897825147:AAHgX3F2Amr3bxcvRn1XrsOwNsyRtA_CzeE"
 if not TOKEN:
     raise ValueError("Не задан TELEGRAM_TOKEN")
 
+# Начальные администраторы (из переменной окружения)
 INITIAL_ADMINS = []
-admins_env = os.environ.get("ADMIN_IDS", "")
+admins_env = "5949150362"
 if admins_env:
     INITIAL_ADMINS = [int(x.strip()) for x in admins_env.split(",") if x.strip()]
 
@@ -38,6 +42,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
+    # Пользователи
     cur.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -46,6 +51,8 @@ def init_db():
         xp INTEGER DEFAULT 0,
         total_xp INTEGER DEFAULT 0,
         bio TEXT DEFAULT '',
+        custom_fields TEXT DEFAULT '{}',
+        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         coins INTEGER DEFAULT 0,
         warnings_count INTEGER DEFAULT 0,
         is_muted BOOLEAN DEFAULT 0,
@@ -53,12 +60,15 @@ def init_db():
         referred_by INTEGER,
         referral_count INTEGER DEFAULT 0,
         active_prefix TEXT,
+        pending_prefix TEXT,
         commission_discount REAL DEFAULT 0.0,
         no_queue BOOLEAN DEFAULT 0
     )''')
 
+    # Гаранты
     cur.execute('''CREATE TABLE IF NOT EXISTS guarantors (
         user_id INTEGER PRIMARY KEY,
+        level INTEGER DEFAULT 1,
         is_active BOOLEAN DEFAULT 1,
         current_deal_id INTEGER,
         total_deals INTEGER DEFAULT 0,
@@ -68,6 +78,7 @@ def init_db():
         commission_rate REAL DEFAULT 0.02
     )''')
 
+    # Сделки
     cur.execute('''CREATE TABLE IF NOT EXISTS deals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         buyer_id INTEGER,
@@ -84,6 +95,7 @@ def init_db():
         priority BOOLEAN DEFAULT 0
     )''')
 
+    # Заявки на сделку (ожидание назначения гаранта)
     cur.execute('''CREATE TABLE IF NOT EXISTS deal_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         buyer_id INTEGER,
@@ -95,6 +107,7 @@ def init_db():
         status TEXT DEFAULT 'waiting'
     )''')
 
+    # Магазин товаров
     cur.execute('''CREATE TABLE IF NOT EXISTS store_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -105,6 +118,7 @@ def init_db():
         available BOOLEAN DEFAULT 1
     )''')
 
+    # Приобретённые товары пользователей
     cur.execute('''CREATE TABLE IF NOT EXISTS user_items (
         user_id INTEGER,
         item_id INTEGER,
@@ -112,6 +126,7 @@ def init_db():
         PRIMARY KEY (user_id, item_id)
     )''')
 
+    # Заявки на префиксы (ожидание одобрения)
     cur.execute('''CREATE TABLE IF NOT EXISTS prefix_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -119,6 +134,7 @@ def init_db():
         status TEXT DEFAULT 'pending'
     )''')
 
+    # Отзывы о гарантах
     cur.execute('''CREATE TABLE IF NOT EXISTS feedbacks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         from_user INTEGER,
@@ -129,6 +145,7 @@ def init_db():
         deleted BOOLEAN DEFAULT 0
     )''')
 
+    # Скам-база (основная)
     cur.execute('''CREATE TABLE IF NOT EXISTS scammers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL,
@@ -137,6 +154,7 @@ def init_db():
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
+    # Заявки на скамеров (от пользователей)
     cur.execute('''CREATE TABLE IF NOT EXISTS scam_reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         reported_username TEXT NOT NULL,
@@ -147,6 +165,16 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
+    # Внешние скам-боты (для интеграции)
+    cur.execute('''CREATE TABLE IF NOT EXISTS external_bots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        username TEXT,
+        api_url TEXT,
+        is_active BOOLEAN DEFAULT 1
+    )''')
+
+    # Уровни пользователей
     cur.execute('''CREATE TABLE IF NOT EXISTS levels (
         name TEXT PRIMARY KEY,
         xp_required INTEGER,
@@ -155,16 +183,18 @@ def init_db():
         no_queue BOOLEAN DEFAULT 0
     )''')
 
+    # Настройки (ключ-значение)
     cur.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
 
+    # Чёрный список слов
     cur.execute('''CREATE TABLE IF NOT EXISTS blacklist (
         word TEXT PRIMARY KEY
     )''')
 
-    # Добавляем уровни по умолчанию
+    # Добавляем уровни по умолчанию, если их нет
     cur.execute("SELECT COUNT(*) FROM levels")
     if cur.fetchone()[0] == 0:
         cur.executemany(
@@ -184,6 +214,7 @@ def init_db():
         ('moderation_enabled', '1'),
         ('filter_links', '1'),
         ('filter_badwords', '1'),
+        ('filter_spam', '1'),
         ('xp_per_message', '1'),
         ('ref_bonus_coins', '50'),
         ('ref_bonus_xp', '10'),
@@ -191,7 +222,7 @@ def init_db():
         ('default_commission', '0.02'),
         ('scam_action', 'mute'),
         ('admin_ids', ','.join(map(str, INITIAL_ADMINS))),
-        ('commission_currency', 'coins')
+        ('commission_currency', 'coins')  # 'coins' или 'usdt'
     ]
     for key, value in defaults:
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
@@ -223,7 +254,7 @@ def get_setting(key):
 def set_setting(key, value):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     conn.commit()
     conn.close()
 
@@ -258,19 +289,27 @@ def create_user_if_not_exists(user_id, username, full_name, referred_by=None):
         "INSERT OR IGNORE INTO users (user_id, username, full_name, referred_by) VALUES (?, ?, ?, ?)",
         (user_id, username, full_name, referred_by)
     )
-    if referred_by:
-        ref_coins = int(get_setting('ref_bonus_coins') or 50)
-        ref_xp = int(get_setting('ref_bonus_xp') or 10)
-        cur.execute("UPDATE users SET referral_count = referral_count + 1, coins = coins + ? WHERE user_id = ?",
-                    (ref_coins, referred_by))
-        add_xp(referred_by, ref_xp)
+    is_new_user = cur.rowcount > 0
+    reward_referrer_id = None
+    reward_ref_xp = 0
+    if is_new_user and referred_by and referred_by != user_id:
+        cur.execute("SELECT 1 FROM users WHERE user_id = ?", (referred_by,))
+        if cur.fetchone():
+            ref_coins = int(get_setting('ref_bonus_coins') or 50)
+            reward_ref_xp = int(get_setting('ref_bonus_xp') or 10)
+            cur.execute(
+                "UPDATE users SET referral_count = referral_count + 1, coins = coins + ? WHERE user_id = ?",
+                (ref_coins, referred_by)
+            )
+            reward_referrer_id = referred_by
     conn.commit()
     conn.close()
+    if reward_referrer_id:
+        add_xp(reward_referrer_id, reward_ref_xp)
 
 def update_user_field(user_id, field, value):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    # безопасно: поле передаётся только из кода, не от пользователя
     cur.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
     conn.commit()
     conn.close()
@@ -312,7 +351,7 @@ def add_xp(user_id, amount):
                 add_coins(user_id, bonus)
                 update_user_field(user_id, 'commission_discount', comm)
                 update_user_field(user_id, 'no_queue', 1 if noq else 0)
-                asyncio.create_task(bot.send_message(user_id, f"🎉 Вы достигли уровня {new_level}! Получено {bonus} монет."))
+                asyncio.create_task(bot.send_message(user_id, f"🎉 Поздравляем! Вы достигли уровня {new_level}! Получено {bonus} монет."))
                 break
     cur.execute(
         "UPDATE users SET xp = ?, total_xp = ?, level = ? WHERE user_id = ?",
@@ -472,6 +511,7 @@ def get_feedbacks_for_guarantor(guarantor_id, limit=10):
     conn.close()
     return rows
 
+# ===================== СКАМ-СИСТЕМА =====================
 def add_scammer(username, evidence, admin_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -525,7 +565,7 @@ def approve_scam_report(report_id, admin_id):
     if row:
         username, evidence = row
         add_scammer(username, evidence, admin_id)
-        cur.execute("UPDATE scam_reports SET status = 'approved', admin_comment = 'Одобрено' WHERE id = ?", (report_id,))
+        cur.execute("UPDATE scam_reports SET status = 'approved', admin_comment = 'Одобрено админом' WHERE id = ?", (report_id,))
         conn.commit()
         conn.close()
         return True
@@ -539,6 +579,51 @@ def reject_scam_report(report_id, comment):
     conn.commit()
     conn.close()
 
+# ===================== ВНЕШНИЕ СКАМ-БОТЫ =====================
+def add_external_bot(name, username, api_url):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO external_bots (name, username, api_url) VALUES (?, ?, ?)",
+        (name, username, api_url)
+    )
+    conn.commit()
+    conn.close()
+
+def remove_external_bot(bot_id):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM external_bots WHERE id = ?", (bot_id,))
+    conn.commit()
+    conn.close()
+
+def get_external_bots():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, username, api_url FROM external_bots WHERE is_active = 1")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+async def check_external_bot(username, api_url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{api_url}?username={username}") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('found', False)
+    except:
+        return False
+    return False
+
+async def check_all_external_bots(username):
+    bots = get_external_bots()
+    for bot_id, name, bot_username, api_url in bots:
+        if await check_external_bot(username, api_url):
+            return True, name
+    return False, None
+
+# ===================== МАГАЗИН И ПРЕФИКСЫ =====================
 def get_store_items():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -567,19 +652,31 @@ def remove_store_item(item_id):
 def buy_item(user_id, item_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("SELECT id, price, type, value FROM store_items WHERE id = ? AND available = 1", (item_id,))
+    cur.execute("SELECT id, name, price, type, value FROM store_items WHERE id = ? AND available = 1", (item_id,))
     item = cur.fetchone()
     if not item:
         conn.close()
         return None
-    if get_coins(user_id) < item[1]:
+    if get_coins(user_id) < item[2]:
         conn.close()
         return False
-    update_user_field(user_id, 'coins', get_coins(user_id) - item[1])
-    cur.execute("INSERT INTO user_items (user_id, item_id) VALUES (?, ?)", (user_id, item_id))
+    update_user_field(user_id, 'coins', get_coins(user_id) - item[2])
+    try:
+        cur.execute("INSERT INTO user_items (user_id, item_id) VALUES (?, ?)", (user_id, item_id))
+    except sqlite3.IntegrityError:
+        conn.close()
+        return "already_owned"
     conn.commit()
     conn.close()
     return item
+
+def get_user_items(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT item_id FROM user_items WHERE user_id = ?", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def add_prefix_request(user_id, prefix):
     conn = sqlite3.connect(DB_NAME)
@@ -641,13 +738,17 @@ def remove_badword(word):
     cur = conn.cursor()
     cur.execute("DELETE FROM blacklist WHERE word = ?", (word,))
     conn.commit()
+    conn.close()
+
 # ===================== СОСТОЯНИЯ ДЛЯ FSM =====================
+# Все состояния объединены в одном классе
 class DealStates(StatesGroup):
     waiting_for_seller = State()
     waiting_for_amount = State()
     waiting_for_description = State()
 
 class AdminStates(StatesGroup):
+    waiting_for_bio = State()
     waiting_for_level_name = State()
     waiting_for_level_xp = State()
     waiting_for_level_bonus = State()
@@ -667,17 +768,32 @@ class AdminStates(StatesGroup):
     waiting_for_prefix_reject = State()
     waiting_for_vip_threshold_amount = State()
     waiting_for_vip_threshold_level = State()
+    waiting_for_moderation_toggle = State()
+    waiting_for_xp_per_message = State()
+    waiting_for_ref_bonus = State()
+    waiting_for_deal_xp_percent = State()
+    waiting_for_default_commission = State()
+    waiting_for_scam_action = State()
     waiting_for_user_search = State()
+    waiting_for_guarantor_id = State()
     waiting_for_user_xp = State()
     waiting_for_user_coins = State()
     waiting_for_user_level = State()
     waiting_for_remove_guarantor = State()
+    waiting_for_external_bot_name = State()
+    waiting_for_external_bot_username = State()
+    waiting_for_external_bot_api = State()
+    waiting_for_scam_report_approve = State()
+    waiting_for_scam_report_reject = State()
     waiting_for_remove_scammer = State()
 
 class FeedbackStates(StatesGroup):
     waiting_for_guarantor = State()
     waiting_for_rating = State()
     waiting_for_text = State()
+
+class PrefixStates(StatesGroup):
+    waiting_for_prefix = State()
 
 class BuyStates(StatesGroup):
     waiting_for_item_id = State()
@@ -688,10 +804,10 @@ class ReportScamStates(StatesGroup):
 
 # ===================== ОБРАБОТЧИКИ КОМАНД =====================
 @dp.message(Command("start"))
-async def start_cmd(message: Message, command: CommandObject):
+async def start_cmd(message: Message, command: CommandObject = None):
     user = message.from_user
     referred_by = None
-    if command.args:
+    if command and command.args:
         try:
             referred_by = int(command.args)
         except:
@@ -713,7 +829,7 @@ async def start_cmd(message: Message, command: CommandObject):
 # ------ Меню (обработчики callback) ------
 @dp.callback_query(lambda c: c.data.startswith("menu_"))
 async def menu_callback(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split("_")[1]
+    action = callback.data.removeprefix("menu_")
     if action == "profile":
         await show_profile(callback.message, callback.from_user.id)
     elif action == "deal":
@@ -726,7 +842,7 @@ async def menu_callback(callback: CallbackQuery, state: FSMContext):
         await show_help(callback.message)
     elif action == "admin":
         if is_admin(callback.from_user.id):
-            await admin_panel(callback.message)
+            await admin_panel(callback.message, callback.from_user.id)
         else:
             await callback.answer("Нет доступа", show_alert=True)
     elif action == "main":
@@ -748,14 +864,14 @@ async def show_profile(message: Message, user_id: int = None):
         f"👤 Имя: {user[2]}\n"
         f"📊 Уровень: {user[3]}\n"
         f"⭐ Опыт: {user[4]} XP (всего {user[5]})\n"
-        f"💰 Монеты: {user[8]}\n"
-        f"⚠️ Предупреждения: {user[9]}\n"
-        f"🔗 Рефералов: {user[12] or 0}\n"
-        f"💳 Скидка на комиссию: {user[15] * 100}%\n"
-        f"🚀 Без очереди: {'Да' if user[16] else 'Нет'}\n"
+        f"💰 Монеты: {user[9]}\n"
+        f"⚠️ Предупреждения: {user[10]}\n"
+        f"🔗 Рефералов: {user[14] or 0}\n"
+        f"💳 Скидка на комиссию: {user[17] * 100}%\n"
+        f"🚀 Без очереди: {'Да' if user[18] else 'Нет'}\n"
     )
-    if user[14]:
-        text += f"🏷️ Активный префикс: {user[14]}\n"
+    if user[15]:
+        text += f"🏷️ Активный префикс: {user[15]}\n"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать био", callback_data="edit_bio")],
@@ -764,15 +880,18 @@ async def show_profile(message: Message, user_id: int = None):
     ])
     if is_admin(message.from_user.id):
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="menu_admin")])
-    await message.edit_text(text, reply_markup=keyboard)
+    try:
+        await message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data == "edit_bio")
 async def edit_bio_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✏️ Отправьте новую биографию:")
-    await state.set_state(AdminStates.waiting_for_level_name)  # временно используем состояние
+    await state.set_state(AdminStates.waiting_for_bio)
     await callback.answer()
 
-@dp.message(AdminStates.waiting_for_level_name)  # обработчик для био
+@dp.message(AdminStates.waiting_for_bio)
 async def process_bio(message: Message, state: FSMContext):
     update_user_field(message.from_user.id, 'bio', message.text)
     await state.clear()
@@ -795,11 +914,9 @@ async def my_feedbacks(callback: CallbackQuery):
     await callback.answer()
 
 # ------ Создание сделки ------
-@dp.callback_query(lambda c: c.data == "menu_deal")
-async def create_deal_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🔒 Создание сделки.\nВведите @username продавца:")
+async def create_deal_start(message: Message, user_id: int, state: FSMContext):
+    await message.edit_text("🔒 Создание сделки.\nВведите @username продавца:")
     await state.set_state(DealStates.waiting_for_seller)
-    await callback.answer()
 
 @dp.message(DealStates.waiting_for_seller)
 async def deal_seller(message: Message, state: FSMContext):
@@ -986,6 +1103,7 @@ async def choose_place(callback: CallbackQuery):
         except Exception as e:
             await callback.answer(f"Ошибка создания ссылки: {e}", show_alert=True)
             return
+        # Не пытаемся добавлять участников принудительно, они перейдут по ссылке
         update_deal_status(deal_id, 'vip_created')
         await bot.send_message(buyer_id, f"🏢 Ссылка на VIP-офис: {invite_link}")
         await bot.send_message(seller_id, f"🏢 Ссылка на VIP-офис: {invite_link}")
@@ -1092,7 +1210,6 @@ async def feedback_text(message: Message, state: FSMContext):
     await message.answer("✅ Спасибо за отзыв!")
 
 # ------ Магазин ------
-@dp.callback_query(lambda c: c.data == "menu_shop")
 async def show_shop(message: Message):
     items = get_store_items()
     if not items:
@@ -1125,17 +1242,18 @@ async def process_buy_item(message: Message, state: FSMContext):
         await message.answer("❌ Товар не найден или недоступен.")
     elif result is False:
         await message.answer("❌ Недостаточно монет.")
+    elif result == "already_owned":
+        await message.answer("❌ Этот товар уже куплен.")
     else:
-        item_type, item_value = result[2], result[3]
+        item_name, item_type, item_value = result[1], result[3], result[4]
         if item_type == 'prefix':
             add_prefix_request(message.from_user.id, item_value)
-            await message.answer(f"✅ Товар '{result[0]}' куплен! Заявка на префикс отправлена администратору на одобрение.")
+            await message.answer(f"✅ Товар '{item_name}' куплен! Заявка на префикс отправлена администратору на одобрение.")
         else:
-            await message.answer(f"✅ Товар '{result[0]}' куплен! Тип: {item_type}, значение: {item_value}.")
+            await message.answer(f"✅ Товар '{item_name}' куплен! Тип: {item_type}, значение: {item_value}.")
     await state.clear()
 
 # ------ Рефералы ------
-@dp.callback_query(lambda c: c.data == "menu_referral")
 async def show_referral(message: Message, user_id: int = None):
     if not user_id:
         user_id = message.from_user.id
@@ -1147,7 +1265,7 @@ async def show_referral(message: Message, user_id: int = None):
     ref_link = f"https://t.me/{bot_username}?start={user_id}"
     text = (
         f"👥 Ваша реферальная ссылка:\n{ref_link}\n\n"
-        f"Приглашено: {user[12] or 0}\n"
+        f"Приглашено: {user[14] or 0}\n"
         f"Бонус за приглашение: {get_setting('ref_bonus_coins')} монет и {get_setting('ref_bonus_xp')} XP"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1156,7 +1274,6 @@ async def show_referral(message: Message, user_id: int = None):
     await message.edit_text(text, reply_markup=keyboard)
 
 # ------ Помощь ------
-@dp.callback_query(lambda c: c.data == "menu_help")
 async def show_help(message: Message):
     text = (
         "📋 Помощь по боту\n\n"
@@ -1177,11 +1294,9 @@ async def show_help(message: Message):
     await message.edit_text(text, reply_markup=keyboard)
 
 # ------ Сообщить о скамере ------
-@dp.callback_query(lambda c: c.data == "menu_report_scam")
 async def report_scam_start(message: Message, user_id: int, state: FSMContext):
     await message.edit_text("⚠️ Сообщение о скамере.\nВведите @username мошенника:")
     await state.set_state(ReportScamStates.waiting_for_username)
-    await message.answer()
 
 @dp.message(ReportScamStates.waiting_for_username)
 async def report_scam_username(message: Message, state: FSMContext):
@@ -1241,11 +1356,15 @@ async def reject_scam(callback: CallbackQuery):
     reject_scam_report(report_id, "Отклонено админом")
     await callback.message.edit_text(f"❌ Заявка #{report_id} отклонена.")
     await callback.answer()
+
 # ===================== АДМИН-ПАНЕЛЬ (ОСНОВНОЕ МЕНЮ) =====================
-@dp.callback_query(lambda c: c.data == "menu_admin")
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.edit_text("⛔ Нет доступа.")
+async def admin_panel(message: Message, actor_id: int = None):
+    check_user_id = actor_id if actor_id is not None else (message.from_user.id if message.from_user else 0)
+    if not is_admin(check_user_id):
+        try:
+            await message.edit_text("⛔ Нет доступа.")
+        except TelegramBadRequest:
+            await message.answer("⛔ Нет доступа.")
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👑 Управление гарантами", callback_data="admin_guarantors")],
@@ -1258,9 +1377,13 @@ async def admin_panel(message: Message):
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="⚙️ Настройки VIP", callback_data="admin_vip_settings")],
         [InlineKeyboardButton(text="📝 Управление отзывами", callback_data="admin_feedbacks")],
+        [InlineKeyboardButton(text="🔗 Внешние скам-боты", callback_data="admin_external_bots")],
         [InlineKeyboardButton(text="🔙 Главное меню", callback_data="menu_main")],
     ])
-    await message.edit_text("👑 Админ-панель:", reply_markup=keyboard)
+    try:
+        await message.edit_text("👑 Админ-панель:", reply_markup=keyboard)
+    except TelegramBadRequest:
+        await message.answer("👑 Админ-панель:", reply_markup=keyboard)
 
 # ----- Управление гарантами -----
 @dp.callback_query(lambda c: c.data == "admin_guarantors")
@@ -1271,7 +1394,7 @@ async def admin_guarantors(callback: CallbackQuery):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute(
-        "SELECT user_id, is_active, current_deal_id, total_deals, rating, feedback_count, vip_chat_id, commission_rate FROM guarantors"
+        "SELECT user_id, level, is_active, current_deal_id, total_deals, rating, feedback_count, vip_chat_id, commission_rate FROM guarantors"
     )
     rows = cur.fetchall()
     conn.close()
@@ -1279,8 +1402,8 @@ async def admin_guarantors(callback: CallbackQuery):
     if not rows:
         text += "Нет гарантов."
     for row in rows:
-        text += f"ID: {row[0]} | Активен: {'Да' if row[1] else 'Нет'} | Сделок: {row[3]}\n"
-        text += f"Рейтинг: {row[4]:.2f} (отзывов: {row[5]}) | VIP-чат: {row[6] or 'не задан'} | Комиссия: {row[7]*100}%\n"
+        text += f"ID: {row[0]} | Активен: {'Да' if row[2] else 'Нет'} | Сделок: {row[4]}\n"
+        text += f"Рейтинг: {row[5]:.2f} (отзывов: {row[6]}) | VIP-чат: {row[7] or 'не задан'} | Комиссия: {row[8]*100}%\n"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить гаранта", callback_data="admin_add_guarantor")],
         [InlineKeyboardButton(text="❌ Удалить гаранта", callback_data="admin_remove_guarantor")],
@@ -1292,10 +1415,10 @@ async def admin_guarantors(callback: CallbackQuery):
 @dp.callback_query(lambda c: c.data == "admin_add_guarantor")
 async def add_guarantor_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введите ID пользователя (число):")
-    await state.set_state(AdminStates.waiting_for_user_search)
+    await state.set_state(AdminStates.waiting_for_guarantor_id)
     await callback.answer()
 
-@dp.message(AdminStates.waiting_for_user_search)
+@dp.message(AdminStates.waiting_for_guarantor_id)
 async def process_add_guarantor(message: Message, state: FSMContext):
     try:
         user_id = int(message.text.strip())
@@ -1413,7 +1536,7 @@ async def process_level_noqueue(message: Message, state: FSMContext):
     await message.answer("✅ Уровень добавлен!")
 
 @dp.callback_query(lambda c: c.data == "admin_del_level")
-async def del_level_start(callback: CallbackQuery):
+async def del_level_start(callback: CallbackQuery, state: FSMContext):
     levels = get_levels()
     if len(levels) <= 1:
         await callback.answer("Нельзя удалить единственный уровень", show_alert=True)
@@ -1500,7 +1623,7 @@ async def process_item_value(message: Message, state: FSMContext):
     await message.answer("✅ Товар добавлен!")
 
 @dp.callback_query(lambda c: c.data == "admin_remove_item")
-async def remove_item_start(callback: CallbackQuery):
+async def remove_item_start(callback: CallbackQuery, state: FSMContext):
     items = get_store_items()
     if not items:
         await callback.answer("Нет товаров для удаления", show_alert=True)
@@ -1542,12 +1665,14 @@ async def admin_moderation(callback: CallbackQuery):
     moderation_enabled = get_setting('moderation_enabled') == '1'
     filter_links = get_setting('filter_links') == '1'
     filter_badwords = get_setting('filter_badwords') == '1'
+    filter_spam = get_setting('filter_spam') == '1'
     xp_per_message = get_setting('xp_per_message') or '1'
     text = (
         f"🔞 Настройки модерации:\n"
         f"Модерация включена: {'Да' if moderation_enabled else 'Нет'}\n"
         f"Фильтр ссылок: {'Да' if filter_links else 'Нет'}\n"
         f"Фильтр мата: {'Да' if filter_badwords else 'Нет'}\n"
+        f"Фильтр спама: {'Да' if filter_spam else 'Нет'}\n"
         f"XP за сообщение: {xp_per_message}\n"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1721,10 +1846,10 @@ async def show_user_info(message: Message, user):
         f"ID: {user[0]}\n"
         f"Уровень: {user[3]}\n"
         f"Опыт: {user[4]} XP (всего {user[5]})\n"
-        f"Монеты: {user[8]}\n"
-        f"Предупреждения: {user[9]}\n"
-        f"Рефералов: {user[12] or 0}\n"
-        f"Активный префикс: {user[14] or 'нет'}\n"
+        f"Монеты: {user[9]}\n"
+        f"Предупреждения: {user[10]}\n"
+        f"Рефералов: {user[14] or 0}\n"
+        f"Активный префикс: {user[15] or 'нет'}\n"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Начислить XP", callback_data=f"admin_addxp_{user[0]}")],
@@ -1793,12 +1918,19 @@ async def admin_setlevel_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("setlevel_"))
 async def process_setlevel(callback: CallbackQuery):
-    parts = callback.data.split("_")
+    parts = callback.data.split("_", 2)
     user_id = int(parts[1])
     level_name = parts[2]
     update_user_field(user_id, 'level', level_name)
     await callback.message.edit_text(f"✅ Уровень изменён на {level_name}.")
     await admin_users(callback)
+
+@dp.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    await admin_panel(message)
 
 @dp.callback_query(lambda c: c.data == "admin_top_users")
 async def admin_top_users(callback: CallbackQuery):
@@ -2022,37 +2154,85 @@ async def process_delete_feedback(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Отзыв #{fb_id} удалён.")
 
-# ===================== МОДЕРАЦИЯ (объединённый обработчик) =====================
-@dp.message()
-async def handle_all_messages(message: Message):
-    # Проверка на новых участников
-    if message.new_chat_members:
-        for member in message.new_chat_members:
-            username = member.username or ''
-            if is_scammer(username):
-                action = get_setting('scam_action') or 'mute'
-                try:
-                    if action == 'ban':
-                        await bot.ban_chat_member(message.chat.id, member.id)
-                        await message.answer(f"🚫 Пользователь @{username} забанен (найден в скам-базе).")
-                    else:
-                        await bot.restrict_chat_member(message.chat.id, member.id, permissions=ChatPermissions(can_send_messages=False))
-                        await message.answer(f"🔇 Пользователь @{username} замучен (найден в скам-базе).")
-                except Exception as e:
-                    logging.error(f"Ошибка при блокировке {username}: {e}")
-                for admin_id in INITIAL_ADMINS:
-                    await bot.send_message(admin_id, f"🚨 Действие ({action}) применено к скамеру @{username} в чате {message.chat.title}")
+# ----- Внешние скам-боты -----
+@dp.callback_query(lambda c: c.data == "admin_external_bots")
+async def admin_external_bots(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
         return
+    bots = get_external_bots()
+    text = "🔗 Внешние скам-боты:\n\n"
+    if not bots:
+        text += "Нет подключённых ботов."
+    else:
+        for bot_data in bots:
+            text += f"ID: {bot_data[0]} | {bot_data[1]} (@{bot_data[2]}) | API: {bot_data[3]}\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить бота", callback_data="admin_add_external_bot")],
+        [InlineKeyboardButton(text="❌ Удалить бота", callback_data="admin_remove_external_bot")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")],
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
 
-    # Модерация обычных сообщений
+@dp.callback_query(lambda c: c.data == "admin_add_external_bot")
+async def add_external_bot_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите название бота:")
+    await state.set_state(AdminStates.waiting_for_external_bot_name)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_external_bot_name)
+async def process_ext_bot_name(message: Message, state: FSMContext):
+    await state.update_data(ext_name=message.text)
+    await message.answer("Введите username бота (например, @ScamBot):")
+    await state.set_state(AdminStates.waiting_for_external_bot_username)
+
+@dp.message(AdminStates.waiting_for_external_bot_username)
+async def process_ext_bot_username(message: Message, state: FSMContext):
+    username = message.text.strip().lstrip('@')
+    await state.update_data(ext_username=username)
+    await message.answer("Введите API URL (например, https://scambot.com/api/check):")
+    await state.set_state(AdminStates.waiting_for_external_bot_api)
+
+@dp.message(AdminStates.waiting_for_external_bot_api)
+async def process_ext_bot_api(message: Message, state: FSMContext):
+    api_url = message.text.strip()
+    data = await state.get_data()
+    add_external_bot(data['ext_name'], data['ext_username'], api_url)
+    await state.clear()
+    await message.answer("✅ Внешний бот добавлен!")
+
+@dp.callback_query(lambda c: c.data == "admin_remove_external_bot")
+async def remove_external_bot_start(callback: CallbackQuery):
+    bots = get_external_bots()
+    if not bots:
+        await callback.answer("Нет ботов для удаления", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{b[1]} (ID: {b[0]})", callback_data=f"remove_extbot_{b[0]}")] for b in bots
+    ])
+    await callback.message.edit_text("Выберите бота для удаления:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("remove_extbot_"))
+async def confirm_remove_extbot(callback: CallbackQuery):
+    bot_id = int(callback.data.split("_")[2])
+    remove_external_bot(bot_id)
+    await callback.message.edit_text("✅ Бот удалён.")
+    await admin_external_bots(callback)
+
+# ===================== МОДЕРАЦИЯ =====================
+@dp.message()
+async def moderate_message(message: Message):
+    if message.new_chat_members:
+        await handle_new_member(message)
+        return
     if message.from_user.is_bot or is_admin(message.from_user.id):
         return
-
-    # Проверка мута
     user = get_user(message.from_user.id)
-    if user and user[9] == 1 and user[10]:
+    if user and user[11] == 1 and user[12]:
         try:
-            mute_until = datetime.fromisoformat(user[10])
+            mute_until = datetime.fromisoformat(user[12])
             if mute_until > datetime.now():
                 await message.delete()
                 return
@@ -2061,31 +2241,51 @@ async def handle_all_messages(message: Message):
                 update_user_field(message.from_user.id, 'mute_until', None)
         except:
             pass
-
-    # Проверка ссылок и мата
     if get_setting('moderation_enabled') == '1':
         if get_setting('filter_links') == '1':
             if re.search(r'(https?://[^\s]+)', message.text or ''):
                 allowed = ['t.me', 'ton.org', 'telegram.org']
                 if not any(dom in message.text for dom in allowed):
                     await message.delete()
-                    sent = await message.answer("🚫 Ссылки запрещены.")
-                    await asyncio.sleep(10)
-                    await sent.delete()
+                    await message.answer("🚫 Ссылки запрещены.")
                     return
         if get_setting('filter_badwords') == '1':
             badwords = get_badwords()
             if any(word in (message.text or '').lower() for word in badwords):
                 await message.delete()
-                sent = await message.answer("🚫 Нецензурная лексика запрещена.")
-                await asyncio.sleep(10)
-                await sent.delete()
+                await message.answer("🚫 Нецензурная лексика запрещена.")
                 return
+    if get_setting('xp_per_message') and int(get_setting('xp_per_message')) > 0:
+        add_xp(message.from_user.id, int(get_setting('xp_per_message')))
 
-    # Начисление XP за сообщение
-    xp_per_msg = int(get_setting('xp_per_message') or 0)
-    if xp_per_msg > 0:
-        add_xp(message.from_user.id, xp_per_msg)
+# ===================== АВТОМАТИЧЕСКАЯ ПРОВЕРКА НОВЫХ УЧАСТНИКОВ =====================
+async def handle_new_member(message: Message):
+    if not message.new_chat_members:
+        return
+    for member in message.new_chat_members:
+        username = member.username or ''
+        if is_scammer(username):
+            action = get_setting('scam_action') or 'mute'
+            if action == 'ban':
+                await bot.ban_chat_member(message.chat.id, member.id)
+                await message.answer(f"🚫 Пользователь @{username} забанен (найден в скам-базе).")
+            else:
+                await bot.restrict_chat_member(message.chat.id, member.id, permissions=ChatPermissions(can_send_messages=False))
+                await message.answer(f"🔇 Пользователь @{username} замучен (найден в скам-базе).")
+            for admin_id in INITIAL_ADMINS:
+                await bot.send_message(admin_id, f"🚨 Действие ({action}) применено к скамеру @{username} в чате {message.chat.title}")
+            continue
+        found, bot_name = await check_all_external_bots(username)
+        if found:
+            action = get_setting('scam_action') or 'mute'
+            if action == 'ban':
+                await bot.ban_chat_member(message.chat.id, member.id)
+                await message.answer(f"🚫 Пользователь @{username} забанен (найден внешним ботом {bot_name}).")
+            else:
+                await bot.restrict_chat_member(message.chat.id, member.id, permissions=ChatPermissions(can_send_messages=False))
+                await message.answer(f"🔇 Пользователь @{username} замучен (найден внешним ботом {bot_name}).")
+            for admin_id in INITIAL_ADMINS:
+                await bot.send_message(admin_id, f"🚨 Действие ({action}) применено к скамеру @{username} (внешний бот {bot_name}) в чате {message.chat.title}")
 
 # ===================== КОМАНДА ДЛЯ ГАРАНТА: УСТАНОВИТЬ VIP-ЧАТ =====================
 @dp.message(Command("setvipchat"))
@@ -2136,5 +2336,3 @@ if __name__ == "__main__":
     from threading import Thread
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))).start()
     asyncio.run(main())
-
-    conn.close()
